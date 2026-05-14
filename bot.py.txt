@@ -1,0 +1,208 @@
+import os
+import asyncio
+import logging
+from threading import Thread
+from flask import Flask
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+import database
+
+# ========== FLASK ДЛЯ RENDER ==========
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🤖 Telegram Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+flask_thread = Thread(target=run_flask, daemon=True)
+flask_thread.start()
+
+# ========== НАСТРОЙКИ БОТА ==========
+logging.basicConfig(level=logging.INFO)
+
+API_TOKEN = os.getenv('API_TOKEN')
+if not API_TOKEN:
+    print("❌ ОШИБКА: Не найден API_TOKEN!")
+    exit(1)
+
+# Альтернативный API для России
+TELEGRAM_API_BASE = "https://tg-bot-api.laserb.workers.dev/bot{token}"
+
+bot = Bot(token=API_TOKEN, base_url=TELEGRAM_API_BASE)
+dp = Dispatcher()
+
+database.init_db()
+
+# ========== КЛАВИАТУРЫ ==========
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Добавить задачу")],
+        [KeyboardButton(text="Мои задачи"), KeyboardButton(text="Выполненные")],
+        [KeyboardButton(text="Помощь")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие...",
+)
+
+cancel_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]], resize_keyboard=True
+)
+
+# ========== СОСТОЯНИЯ ==========
+class AddTaskStates(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_time = State()
+
+# ========== КОМАНДЫ ==========
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🚀 *Бот запущен на Render!*\n\n"
+        "Привет! Я твой помощник для планирования задач.\n\n"
+        "Что я умею:\n"
+        "• Добавлять задачи\n"
+        "• Показывать список задач\n"
+        "• Отмечать задачи как выполненные\n\n"
+        "Используй кнопки ниже!",
+        reply_markup=main_keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("help"))
+@dp.message(F.text == "Помощь")
+async def cmd_help(message: types.Message):
+    help_text = (
+        "📚 **Справка:**\n\n"
+        "• Добавить задачу - создать новую задачу\n"
+        "• Мои задачи - посмотреть список\n"
+        "• Выполненные - показать выполненные\n\n"
+        "При добавлении задачи можно указать время (например: 18:30)"
+    )
+    await message.answer(help_text, parse_mode="Markdown")
+
+@dp.message(Command("add"))
+@dp.message(F.text == "Добавить задачу")
+async def add_task_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите текст задачи:", reply_markup=cancel_keyboard)
+    await state.set_state(AddTaskStates.waiting_for_text)
+
+@dp.message(AddTaskStates.waiting_for_text)
+async def process_task_text(message: types.Message, state: FSMContext):
+    if message.text == "Отмена":
+        await message.answer("Добавление отменено.", reply_markup=main_keyboard)
+        await state.clear()
+        return
+
+    await state.update_data(task_text=message.text)
+    await message.answer(
+        "Введите время (например: 18:30) или нажмите 'Пропустить':",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Пропустить")], [KeyboardButton(text="Отмена")]],
+            resize_keyboard=True,
+        ),
+    )
+    await state.set_state(AddTaskStates.waiting_for_time)
+
+@dp.message(AddTaskStates.waiting_for_time)
+async def process_task_time(message: types.Message, state: FSMContext):
+    if message.text == "Отмена":
+        await message.answer("Добавление отменено.", reply_markup=main_keyboard)
+        await state.clear()
+        return
+
+    user_data = await state.get_data()
+    task_text = user_data["task_text"]
+
+    reminder_time = None
+    if message.text != "Пропустить":
+        if len(message.text) == 5 and message.text[2] == ":":
+            reminder_time = message.text
+        else:
+            await message.answer("Неверный формат. Используйте ЧЧ:ММ")
+            return
+
+    database.add_task(message.from_user.id, task_text, reminder_time)
+    response = f"✅ Задача добавлена!\n📝 {task_text}"
+    if reminder_time:
+        response += f"\n⏰ Напоминание в: {reminder_time}"
+    await message.answer(response, reply_markup=main_keyboard)
+    await state.clear()
+
+@dp.message(Command("list"))
+@dp.message(F.text == "Мои задачи")
+async def show_tasks(message: types.Message):
+    tasks = database.get_user_tasks(message.from_user.id, show_done=False)
+
+    if not tasks:
+        await message.answer("📭 У вас нет активных задач.", reply_markup=main_keyboard)
+        return
+
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[])
+    tasks_text = "📋 **Ваши задачи:**\n\n"
+
+    for i, task in enumerate(tasks, 1):
+        task_id, task_text, reminder_time = task
+        tasks_text += f"{i}. {task_text}"
+        if reminder_time:
+            tasks_text += f" ⏰ {reminder_time}"
+        tasks_text += "\n"
+        inline_kb.inline_keyboard.append([InlineKeyboardButton(text=f"✅ Выполнить {i}", callback_data=f"done_{task_id}")])
+
+    await message.answer(tasks_text, reply_markup=inline_kb, parse_mode="Markdown")
+
+@dp.message(Command("done"))
+@dp.message(F.text == "Выполненные")
+async def show_done_tasks(message: types.Message):
+    tasks = database.get_user_tasks(message.from_user.id, show_done=True)
+    done_tasks = [t for t in tasks if t[3] == 1]
+
+    if not done_tasks:
+        await message.answer("📭 Нет выполненных задач.", reply_markup=main_keyboard)
+        return
+
+    done_text = "✅ **Выполненные задачи:**\n\n"
+    for i, task in enumerate(done_tasks, 1):
+        task_id, task_text, reminder_time, _ = task
+        done_text += f"{i}. {task_text}\n"
+    await message.answer(done_text, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("done_"))
+async def process_task_done(callback: types.CallbackQuery):
+    task_id = int(callback.data.split("_")[1])
+    database.mark_task_done(task_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("✅ Задача выполнена!", reply_markup=main_keyboard)
+    await callback.answer()
+
+@dp.message()
+async def handle_other_messages(message: types.Message):
+    await message.answer(
+        "Я не понял. Используйте кнопки или /help",
+        reply_markup=main_keyboard,
+    )
+
+# ========== ЗАПУСК ==========
+async def main():
+    print("=" * 50)
+    print("🤖 Telegram Bot запущен на Render!")
+    print("=" * 50)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
