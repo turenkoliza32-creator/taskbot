@@ -1,0 +1,54 @@
+import sqlite3
+import os
+
+# На Render используем /tmp, локально - текущую папку
+DB_PATH = '/tmp/tasks.db' if os.environ.get('RENDER') else 'tasks.db'
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            task_text TEXT NOT NULL,
+            reminder_time TEXT,
+            is_done BOOLEAN DEFAULT FALSE
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print(f"✅ База данных: {DB_PATH}")
+
+def add_task(user_id, task_text, reminder_time=None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO tasks (user_id, task_text, reminder_time) VALUES (?, ?, ?)", 
+                (user_id, task_text, reminder_time))
+    conn.commit()
+    conn.close()
+
+def get_user_tasks(user_id, show_done=False):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if show_done:
+        cur.execute("SELECT id, task_text, reminder_time, is_done FROM tasks WHERE user_id=?", (user_id,))
+    else:
+        cur.execute("SELECT id, task_text, reminder_time FROM tasks WHERE user_id=? AND is_done=FALSE", (user_id,))
+    tasks = cur.fetchall()
+    conn.close()
+    return tasks
+
+def mark_task_done(task_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET is_done=TRUE WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+
+def delete_task(task_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
